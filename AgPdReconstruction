@@ -1,0 +1,328 @@
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
+from ase.cluster.icosahedron import Icosahedron
+from ase.calculators.emt import EMT
+from ase.io import write, Trajectory
+import matplotlib.pyplot as plt
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+class SurfaceSwapEnv:
+    """
+    Ag–Pd nanoalloy surface reconstruction environment
+    using bulk → surface atomic swaps
+    """
+
+    def __init__(
+        self,
+        shell=3,
+        surface_fraction=0.3,
+        max_steps=40,
+        device="cpu",
+    ):
+        self.shell = shell
+        self.surface_fraction = surface_fraction
+        self.max_steps = max_steps
+        self.device = device
+        self._build_initial_structure()
+
+    def _build_initial_structure(self):
+        atoms = Icosahedron("Ag", self.shell)
+        N = len(atoms)
+
+        # 50–50 random Ag–Pd alloy
+        symbols = ["Ag"] * (N // 2) + ["Pd"] * (N - N // 2)
+        random.shuffle(symbols)
+
+        atoms.symbols = symbols
+        atoms.calc = EMT()
+        self.atoms = atoms
+
+        self.initial_energy = self.atoms.get_potential_energy()
+        self.prev_energy = self.initial_energy
+
+    def reset(self):
+        self._build_initial_structure()
+        self.steps = 0
+        self.prev_energy = self.initial_energy
+        return self._get_state()
+
+    def _surface_bulk_indices(self):
+        z = self.atoms.positions[:, 2]
+        cutoff = np.percentile(z, 100 * (1 - self.surface_fraction))
+        surface = np.where(z >= cutoff)[0]
+        bulk = np.where(z < cutoff)[0]
+        return bulk, surface
+
+    def valid_actions(self):
+        bulk, surface = self._surface_bulk_indices()
+        return [(i, j) for i in bulk for j in surface]
+
+    def _get_state(self):
+        bulk, surface = self._surface_bulk_indices()
+
+        is_surface = np.zeros(len(self.atoms), dtype=np.float32)
+        is_surface[surface] = 1.0
+
+        # state = [atomic_number, surface_flag]
+        state = np.column_stack(
+            [self.atoms.numbers.astype(np.float32), is_surface]
+        )
+
+        return torch.tensor(state, dtype=torch.float32, device=self.device)
+
+    def step(self, action):
+        i, j = action
+
+        # swap atomic identities
+        self.atoms.symbols[i], self.atoms.symbols[j] = (
+            self.atoms.symbols[j],
+            self.atoms.symbols[i],
+        )
+
+        energy = float(self.atoms.get_potential_energy())
+
+        # Path-aware reward (based on energy change)
+        reward = self.compute_reward(energy)
+
+        self.prev_energy = energy
+        self.steps += 1
+        done = self.steps >= self.max_steps
+
+        return self._get_state(), reward, done, energy
+
+    def compute_reward(self, energy):
+        """
+        Computes reward based on the energy difference from the best structure.
+        """
+        # Penalize energy if it's higher than the best known energy
+        reward = self.prev_energy - energy  # Reward based on energy reduction
+        
+        # Ensure the reward does not encourage high-energy states
+        if energy > self.prev_energy:
+            reward -= (energy - self.prev_energy)  # Penalize energy increases further
+        
+        # Normalize reward to be within a reasonable range
+        reward = np.clip(reward, -10, 10)  # Clip the reward to avoid large fluctuations
+
+        self.prev_energy = energy  # Update the previous energy to current energy
+        return reward
+
+
+# ============================================================
+# DQN MODEL
+# ============================================================
+
+class SwapDQN(nn.Module):
+    def __init__(self, embed_dim=64):
+        super().__init__()
+        self.embed = nn.Linear(2, embed_dim)
+        self.fc1 = nn.Linear(embed_dim * 2, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, state, actions):
+        emb = self.embed(state)
+        q_vals = []
+
+        for i, j in actions:
+            pair = torch.cat([emb[i], emb[j]], dim=0)
+            q_vals.append(self.fc2(F.relu(self.fc1(pair))))
+
+        return torch.stack(q_vals).squeeze()
+
+
+# ============================================================
+# REPLAY BUFFER
+# ============================================================
+
+class ReplayBuffer:
+    def __init__(self, capacity=20000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, s, a, r, s2, a2, d):
+        self.buffer.append((s, a, r, s2, a2, d))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        return zip(*batch)
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ============================================================
+# TRAINING SETUP
+# ============================================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+env = SurfaceSwapEnv(device=device)
+
+policy = SwapDQN().to(device)
+target = SwapDQN().to(device)
+target.load_state_dict(policy.state_dict())
+target.eval()
+
+optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+buffer = ReplayBuffer()
+
+gamma = 0.99
+batch_size = 64
+
+# Epsilon settings with exponential decay
+epsilon = 1.0
+epsilon_min = 0.01
+epsilon_decay = 5e-5
+
+# Reward scaling settings with exponential decay
+reward_scale = 1.0
+reward_scale_min = 0.1
+reward_scale_decay = 5e-5
+
+target_update_steps = 50
+episodes = 500
+
+best_energy = float("inf")
+global_step = 0
+
+# ============================================================
+# TRAINING LOOP
+# ============================================================
+
+energy_history = []
+reward_history = []
+best_energy_history = []
+best_episode = -1
+
+# To store all the frames for each episode
+episode_trajectories = []
+
+for ep in range(episodes):
+    state = env.reset()
+    done = False
+    total_reward = 0.0
+    episode_frames = []  # List to store frames of each episode
+
+    while not done:
+        actions = env.valid_actions()
+
+        # Exponential epsilon decay (exploration vs exploitation)
+        if random.random() < epsilon:
+            action = random.choice(actions)
+        else:
+            with torch.no_grad():
+                q_vals = policy(state, actions)
+                action = actions[q_vals.argmax().item()]
+
+        next_state, reward, done, energy = env.step(action)
+        next_actions = env.valid_actions()
+
+        buffer.push(state, action, reward, next_state, next_actions, done)
+
+        state = next_state
+        total_reward += reward
+        global_step += 1
+
+        episode_frames.append(env.atoms.copy())  # Save the structure at each step
+
+        # Learning step
+        if len(buffer) >= batch_size:
+            S, A, R, S2, A2, D = buffer.sample(batch_size)
+            q_pred, q_tgt = [], []
+
+            for s, a, r, s2, a2, d in zip(S, A, R, S2, A2, D):
+                q_pred.append(policy(s, [a]).float())
+
+                with torch.no_grad():
+                    if d:
+                        q_tgt.append(
+                            torch.tensor(r, dtype=torch.float32, device=device)
+                        )
+                    else:
+                        q_tgt.append(
+                            torch.tensor(r, dtype=torch.float32, device=device)
+                            + gamma * target(s2, a2).max()
+                        )
+
+            loss = F.mse_loss(torch.stack(q_pred), torch.stack(q_tgt))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # Update target network
+        if global_step % target_update_steps == 0:
+            target.load_state_dict(policy.state_dict())
+
+    # Epsilon and reward scaling decay
+    epsilon = max(epsilon_min, epsilon * np.exp(-epsilon_decay * ep))
+    reward_scale = max(reward_scale_min, reward_scale * np.exp(-reward_scale_decay * ep))
+
+    # Store results
+    energy_history.append(energy)
+    reward_history.append(total_reward)
+    best_energy_history.append(best_energy)
+
+    # Save the entire trajectory as .traj file after every episode
+    traj_filename = f"episode_{ep:04d}_energy_{energy:.6f}_reward_{total_reward:.3f}_epsilon_{epsilon:.3f}.traj"
+    traj = Trajectory(traj_filename, mode='w')
+    for frame in episode_frames:
+        traj.write(frame)
+
+    print(
+        f"Episode {ep:04d} | "
+        f"Energy = {energy:.6f} | "
+        f"Reward = {total_reward:.3f} | "
+        f"Epsilon = {epsilon:.3f} | "
+        f"Saved: {traj_filename}"
+    )
+
+    # Save ONLY if new best energy found
+    if energy < best_energy:
+        best_energy = energy
+        best_episode = ep
+        filename = f"best_structure_ep{ep:04d}_energy_{best_energy:.6f}.xyz"
+        write(filename, env.atoms.copy())
+        print(
+            f"🔥 NEW BEST STRUCTURE | Episode {ep} | "
+            f"Energy = {best_energy:.6f} eV | Saved: {filename}"
+        )
+
+# ============================================================
+# PLOTTING RESULTS (Energy vs Episode, Reward vs Episode)
+# ============================================================
+
+episodes_axis = np.arange(len(energy_history))
+
+plt.figure(figsize=(14, 4))
+
+# -------------------------
+# Energy vs Episodes
+# -------------------------
+plt.subplot(1, 3, 1)
+plt.plot(episodes_axis, energy_history, label="Final Energy", alpha=0.7)
+plt.plot(episodes_axis, best_energy_history, label="Best Energy", linewidth=2)
+plt.xlabel("Episode")
+plt.ylabel("Energy (eV)")
+plt.title("Energy vs Episodes")
+plt.legend()
+plt.grid(True)
+
+# -------------------------
+# Reward vs Episodes
+# -------------------------
+plt.subplot(1, 3, 2)
+plt.plot(episodes_axis, reward_history, color="green")
+plt.xlabel("Episode")
+plt.ylabel("Total Reward")
+plt.title("Reward vs Episodes")
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
