@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 class SurfaceSwapEnv:
     """
-    Ag–Pd nanoalloy surface reconstruction environment
+    Ag–Pd nanoalloy surface segregation environment
     using bulk → surface atomic swaps
     """
 
